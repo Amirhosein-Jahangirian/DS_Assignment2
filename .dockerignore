@@ -1,0 +1,29 @@
+# --- Version control ---------------------------------------------------------
+.git
+.gitignore
+
+# --- Local secrets and environments -----------------------------------------
+.env
+venv/
+.venv/
+env/
+ENV/
+
+# --- Python caches -----------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- Local runtime artifacts -------------------------------------------------
+*.log
+transaction_logs.log
+
+# --- Not needed by the server image -----------------------------------------
+client test/
+docs/
+README.md
+
+# --- Editor / OS noise -------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
