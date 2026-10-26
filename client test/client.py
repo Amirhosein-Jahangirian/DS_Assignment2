@@ -1,3 +1,5 @@
+import os
+
 import requests
 import concurrent.futures
 import time
@@ -6,9 +8,12 @@ import json
 # ============================================================
 # CONFIGURATION
 # ============================================================
-SERVER_IP = "192.168.56.3"  # Replace with your Server VM IP
-BASE_URL = f"http://{SERVER_IP}:8000/api/accounts"
-TEST_ACCOUNT = "A1001"
+# Read from the environment so the client can target a local server,
+# another host, or (later) the gateway.
+SERVER_HOST = os.environ.get("BANK_SERVER_HOST", "127.0.0.1")
+SERVER_PORT = os.environ.get("BANK_SERVER_PORT", "8000")
+BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}/api/accounts"
+TEST_ACCOUNT = os.environ.get("BANK_TEST_ACCOUNT", "A1001")
 
 # Track test results
 test_results = {
@@ -286,8 +291,8 @@ def stage_6():
 
     print(f"\n{'='*60}")
     print("  ACTION REQUIRED:")
-    print("  1. Kill Django server on Server VM (Ctrl+C)")
-    print("  2. Restart Django server")
+    print("  1. Kill the Django server process (Ctrl+C)")
+    print("  2. Restart the Django server")
     print("  3. Press Enter here to continue")
     print(f"{'='*60}")
     input()
@@ -392,7 +397,7 @@ def stage_8():
     print("  VIDEO REMINDERS:")
     print("  • Show transaction_logs.log")
     print("  • Show .env with MAX_CONCURRENT_CLIENTS")
-    print("  • Show both VMs running")
+    print("  • Show the server and the client running on separate hosts")
     print(f"{'='*60}\n")
 
 # ============================================================
