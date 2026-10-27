@@ -25,12 +25,8 @@ USER app
 
 EXPOSE 8000
 
-# One process, many threads: keeps the in-process admission counter and the
-# single file log handler consistent with the current single-node behavior.
-CMD ["gunicorn", "banking_server.wsgi:application", \
-     "--bind", "0.0.0.0:8000", \
-     "--workers", "1", \
-     "--threads", "8", \
-     "--timeout", "60", \
-     "--access-logfile", "-", \
-     "--error-logfile", "-"]
+# Django's development server. Its built-in static handler serves the DRF
+# browsable API and Django admin assets (available while DEBUG=True, which is
+# the current setting). --noreload keeps one process so the in-process
+# admission counter and the file log handler behave as before.
+CMD ["python", "manage.py", "runserver", "0.0.0.0:8000", "--noreload"]
