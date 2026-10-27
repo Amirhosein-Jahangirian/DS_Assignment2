@@ -22,14 +22,22 @@ load_dotenv(BASE_DIR / '.env')
 
 MAX_CONCURRENT_CLIENTS = int(os.environ.get('MAX_CONCURRENT_CLIENTS', '100'))
 
+# Identity of this process, used in logs and response headers. They are
+# overridden per container once shards and replicas exist (Phase 3/4).
+SHARD_ID = os.environ.get('SHARD_ID', 'local')
+REPLICA_ID = os.environ.get('REPLICA_ID', 'local-1')
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-d+112hg!+%u2t2a)3br0srg%dq9-o3fz&pgbnk_3(z4_g1b*2&'
+SECRET_KEY = os.environ.get(
+    'SECRET_KEY',
+    'django-insecure-d+112hg!+%u2t2a)3br0srg%dq9-o3fz&pgbnk_3(z4_g1b*2&',
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get('DEBUG', 'True').strip().lower() in ('1', 'true', 'yes', 'on')
 
 ALLOWED_HOSTS = [
     host.strip()
@@ -151,30 +159,27 @@ SPECTACULAR_SETTINGS = {
     'VERSION': '1.0.0',
 }
 
-# Base directory for log files
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
     'formatters': {
         'transaction_format': {
-            'format': '{asctime}  req={request_id}  ip={ip}  action={action}  account={account}  result={result}  balance={balance}  latency={latency}ms',
+            'format': '{asctime}  shard={shard}  replica={replica}  req={request_id}  ip={ip}  action={action}  account={account}  result={result}  balance={balance}  latency={latency}ms',
             'style': '{',
             'datefmt': '%Y-%m-%dT%H:%M:%S',
         },
     },
     'handlers': {
-        'transaction_file': {
+        'transaction_console': {
             'level': 'INFO',
-            'class': 'logging.FileHandler',
-            'filename': os.path.join(BASE_DIR, 'transaction_logs.log'),
+            'class': 'logging.StreamHandler',
+            'stream': 'ext://sys.stdout',
             'formatter': 'transaction_format',
         },
     },
     'loggers': {
         'banking_transactions': {
-            'handlers': ['transaction_file'],
+            'handlers': ['transaction_console'],
             'level': 'INFO',
             'propagate': False,
         },

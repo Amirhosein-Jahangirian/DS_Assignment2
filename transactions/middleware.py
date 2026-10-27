@@ -58,7 +58,14 @@ class TransactionLoggingMiddleware(MiddlewareMixin):
     
     def process_response(self, request, response):
         global _active_requests
-        
+
+        # Identify the serving replica to clients and to the gateway. Also
+        # echo the request ID so a client can correlate its request with logs.
+        if hasattr(request, 'request_id'):
+            response['X-Request-ID'] = request.request_id
+        response['X-Served-By'] = settings.REPLICA_ID
+        response['X-Shard'] = settings.SHARD_ID
+
         # --- Decrement Active Request Counter ---
         # Only decrement if we actually incremented in process_request
         if getattr(request, '_counter_incremented', False):
@@ -98,6 +105,8 @@ class TransactionLoggingMiddleware(MiddlewareMixin):
         logger.info(
             "Transaction logged",
             extra={
+                'shard': settings.SHARD_ID,
+                'replica': settings.REPLICA_ID,
                 'request_id': getattr(request, 'request_id', 'unknown'),
                 'ip': getattr(request, 'client_ip', 'unknown'),
                 'action': tx_data.get('action', 'unknown'),

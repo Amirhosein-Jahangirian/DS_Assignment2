@@ -3,9 +3,44 @@ from rest_framework.response import Response
 from rest_framework import status
 from .models import Account
 from .serializers import AccountDetailSerializer
+from django.conf import settings
+from django.db import connection
 from django.db import transaction
+from django.http import JsonResponse
 from .serializers import AmountInputSerializer, TransactionResponseSerializer
-import time
+
+
+def health(request):
+    """
+    Liveness/readiness probe for the gateway and Docker.
+
+    Checks the shard database with a trivial query so a replica whose database
+    is unreachable is reported as unavailable. Deliberately outside /api/ so
+    probes are not written to the transaction log.
+    """
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT 1')
+            cursor.fetchone()
+    except Exception:
+        return JsonResponse(
+            {
+                'status': 'error',
+                'shard_id': settings.SHARD_ID,
+                'replica_id': settings.REPLICA_ID,
+                'db': 'unavailable',
+            },
+            status=503,
+        )
+
+    return JsonResponse(
+        {
+            'status': 'ok',
+            'shard_id': settings.SHARD_ID,
+            'replica_id': settings.REPLICA_ID,
+            'db': 'ok',
+        }
+    )
 
 
 class BalanceInquiryView(APIView):
@@ -17,7 +52,6 @@ class BalanceInquiryView(APIView):
     """
 
     def get(self, request, account_number):
-        time.sleep(0.3)  # TESTING ONLY: 100ms delay
         try:
             account = Account.objects.get(account_number=account_number)
         except Account.DoesNotExist:

@@ -21,5 +21,13 @@ class Account(models.Model):
     is_active = models.BooleanField(default=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(balance__gte=0),
+                name='account_balance_non_negative',
+            ),
+        ]
+
     def __str__(self):
         return f"{self.account_number} | Balance: {self.balance}"

@@ -17,10 +17,15 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path, include
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
+from transactions.views import health
 
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('transactions.urls')),  # Prefixes all app URLs with /api/
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
     path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),
+
+    # Container/gateway probe. Not under /api/ on purpose (no transaction-log noise).
+    path('health', health, name='health'),
+    path('health/', health),
 ]
