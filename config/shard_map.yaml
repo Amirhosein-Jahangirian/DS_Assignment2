@@ -1,0 +1,12 @@
+version: 1
+epoch: 1
+
+# Account ranges owned by each shard. Ranges are inclusive, use the
+# A0001 format, and must be contiguous and non-overlapping.
+ranges:
+  - start: A0001
+    end: A1000
+    shard_id: shard-a
+  - start: A1001
+    end: A2000
+    shard_id: shard-b

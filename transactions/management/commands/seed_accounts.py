@@ -1,47 +1,70 @@
 # transactions/management/commands/seed_accounts.py
-from django.core.management.base import BaseCommand
+from decimal import Decimal, InvalidOperation
+
+from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
+
+from transactions import sharding
 from transactions.models import Account
-from decimal import Decimal
 
 
 class Command(BaseCommand):
-    help = 'Seed the database with 5 test accounts (A1001-A1005) with 1000 balance each'
+    help = (
+        'Seed every account in the range owned by this process (SHARD_ID), '
+        'for example A0001-A1000 on shard-a.'
+    )
 
     def add_arguments(self, parser):
         parser.add_argument(
             '--reset',
             action='store_true',
-            help='Delete existing accounts before seeding',
+            help="Delete this shard's accounts before seeding (other shards untouched)",
+        )
+        parser.add_argument(
+            '--balance',
+            default='1000.00',
+            help='Initial balance for newly created accounts (default: 1000.00)',
         )
 
     def handle(self, *args, **options):
-        if options['reset']:
-            deleted_count, _ = Account.objects.all().delete()
-            self.stdout.write(self.style.WARNING(f'Deleted {deleted_count} existing account(s).'))
+        try:
+            ranges = sharding.ranges_for_shard()
+            owned = sharding.account_filter()
+        except Exception as exc:  # ImproperlyConfigured from the shard map
+            raise CommandError(str(exc)) from exc
 
-        accounts_data = [
-            {'account_number': 'A1001', 'balance': Decimal('1000.00')},
-            {'account_number': 'A1002', 'balance': Decimal('1000.00')},
-            {'account_number': 'A1003', 'balance': Decimal('1000.00')},
-            {'account_number': 'A1004', 'balance': Decimal('1000.00')},
-            {'account_number': 'A1005', 'balance': Decimal('1000.00')},
-        ]
+        try:
+            balance = Decimal(options['balance'])
+        except (InvalidOperation, TypeError) as exc:
+            raise CommandError(f'Invalid --balance value: {options["balance"]!r}') from exc
+        if balance < 0:
+            raise CommandError('--balance must not be negative')
 
-        created_count = 0
-        updated_count = 0
+        with transaction.atomic():
+            deleted_count = 0
+            if options['reset']:
+                deleted_count, _ = Account.objects.filter(owned).delete()
 
-        for data in accounts_data:
-            account, created = Account.objects.update_or_create(
-                account_number=data['account_number'],
-                defaults={'balance': data['balance'], 'is_active': True}
+            existing = set(
+                Account.objects.filter(owned).values_list('account_number', flat=True)
             )
-            if created:
-                created_count += 1
-                self.stdout.write(self.style.SUCCESS(f'  ✅ Created {account.account_number} with balance {account.balance}'))
-            else:
-                updated_count += 1
-                self.stdout.write(self.style.WARNING(f'  ⚠️  Updated {account.account_number} to balance {account.balance}'))
 
+            new_accounts = []
+            for account_range in ranges:
+                first = int(account_range.start[1:])
+                last = int(account_range.end[1:])
+                for number in range(first, last + 1):
+                    account_number = f'A{number:04d}'
+                    if account_number not in existing:
+                        new_accounts.append(
+                            Account(account_number=account_number, balance=balance)
+                        )
+
+            Account.objects.bulk_create(new_accounts, batch_size=500)
+
+        span = ', '.join(f'{r.start}-{r.end}' for r in ranges)
         self.stdout.write(self.style.SUCCESS(
-            f'\nDone! Created: {created_count}, Updated: {updated_count}'
+            f'Shard {settings.SHARD_ID} ({span}): deleted {deleted_count}, '
+            f'created {len(new_accounts)}, already present {len(existing)}.'
         ))

@@ -8,6 +8,30 @@ from django.db import connection
 from django.db import transaction
 from django.http import JsonResponse
 from .serializers import AmountInputSerializer, TransactionResponseSerializer
+from .sharding import account_filter, owns
+
+
+def _not_owned_response(request, action, account_number):
+    """
+    Reject an account outside this shard's range.
+
+    The same 404/UNKNOWN_ACCOUNT shape as a genuinely missing account is used
+    on purpose: a shard must not reveal where another shard's accounts live.
+    """
+    request.transaction_data.update({
+        'action': action,
+        'account': account_number,
+        'result': 'error:unknown_account',
+        'balance': 'N/A',
+    })
+    return Response(
+        {
+            'status': 'error',
+            'error_code': 'UNKNOWN_ACCOUNT',
+            'message': f'Account {account_number} does not exist',
+        },
+        status=status.HTTP_404_NOT_FOUND,
+    )
 
 
 def health(request):
@@ -52,6 +76,9 @@ class BalanceInquiryView(APIView):
     """
 
     def get(self, request, account_number):
+        if not owns(account_number):
+            return _not_owned_response(request, 'inquiry', account_number)
+
         try:
             account = Account.objects.get(account_number=account_number)
         except Account.DoesNotExist:
@@ -85,14 +112,15 @@ class BalanceInquiryView(APIView):
 
 class AccountListView(APIView):
     """
-    List All Accounts API
+    List Accounts API
     GET /api/accounts/
 
-    Returns a list of all accounts with their balances.
+    Returns the accounts owned by this shard (its configured range only).
+    A shard never lists accounts that belong to another shard.
     """
 
     def get(self, request):
-        accounts = Account.objects.all().order_by('account_number')
+        accounts = Account.objects.filter(account_filter()).order_by('account_number')
         serializer = AccountDetailSerializer(accounts, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -111,6 +139,9 @@ class DepositView(APIView):
     """
 
     def post(self, request, account_number):
+        if not owns(account_number):
+            return _not_owned_response(request, 'deposit', account_number)
+
         # Step 1: Validate input (handles missing fields, invalid amounts)
         # time.sleep(1)  # TESTING ONLY: 100ms delay
         serializer = AmountInputSerializer(data=request.data)
@@ -194,6 +225,9 @@ class WithdrawView(APIView):
     """
 
     def post(self, request, account_number):
+        if not owns(account_number):
+            return _not_owned_response(request, 'withdraw', account_number)
+
         # time.sleep(1)  # TESTING ONLY: 100ms delay
         # Step 1: Validate input (handles missing fields, invalid amounts)
         serializer = AmountInputSerializer(data=request.data)

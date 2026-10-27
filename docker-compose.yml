@@ -1,41 +1,113 @@
 services:
-  db:
+  # ---------------------------------------------------------------------------
+  # Shard A: accounts A0001-A1000, independent PostgreSQL instance.
+  # ---------------------------------------------------------------------------
+  db-a:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_DB: banking_a
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata-a:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d banking_a"]
       interval: 5s
       timeout: 5s
       retries: 10
 
-  # One-shot schema migration. Runs to completion before the API starts, so
-  # no application container ever races another one on migrations.
-  migrate:
+  # One-shot schema migration for shard A. Runs before api-a starts.
+  migrate-a:
     build: .
     command: ["python", "manage.py", "migrate", "--noinput"]
     env_file: .env
     environment:
-      DB_HOST: db
+      DB_HOST: db-a
+      DB_NAME: banking_a
+      SHARD_ID: shard-a
+      REPLICA_ID: shard-a-migrate
+    volumes:
+      - ./config:/app/config:ro
     depends_on:
-      db:
+      db-a:
         condition: service_healthy
 
-  api:
+  api-a:
     build: .
     env_file: .env
     environment:
-      DB_HOST: db
+      DB_HOST: db-a
+      DB_NAME: banking_a
+      SHARD_ID: shard-a
+      REPLICA_ID: shard-a-1
     ports:
-      - "8000:8000"
+      - "8001:8000"
+    volumes:
+      - ./config:/app/config:ro
     depends_on:
-      db:
+      db-a:
         condition: service_healthy
-      migrate:
+      migrate-a:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Shard B: accounts A1001-A2000, independent PostgreSQL instance.
+  # ---------------------------------------------------------------------------
+  db-b:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: banking_b
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pgdata-b:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d banking_b"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate-b:
+    build: .
+    command: ["python", "manage.py", "migrate", "--noinput"]
+    env_file: .env
+    environment:
+      DB_HOST: db-b
+      DB_NAME: banking_b
+      SHARD_ID: shard-b
+      REPLICA_ID: shard-b-migrate
+    volumes:
+      - ./config:/app/config:ro
+    depends_on:
+      db-b:
+        condition: service_healthy
+
+  api-b:
+    build: .
+    env_file: .env
+    environment:
+      DB_HOST: db-b
+      DB_NAME: banking_b
+      SHARD_ID: shard-b
+      REPLICA_ID: shard-b-1
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./config:/app/config:ro
+    depends_on:
+      db-b:
+        condition: service_healthy
+      migrate-b:
         condition: service_completed_successfully
     healthcheck:
       test:
@@ -49,4 +121,5 @@ services:
       start_period: 10s
 
 volumes:
-  pgdata:
+  pgdata-a:
+  pgdata-b:

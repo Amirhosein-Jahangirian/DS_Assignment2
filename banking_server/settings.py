@@ -26,6 +26,10 @@ MAX_CONCURRENT_CLIENTS = int(os.environ.get('MAX_CONCURRENT_CLIENTS', '100'))
 # overridden per container once shards and replicas exist (Phase 3/4).
 SHARD_ID = os.environ.get('SHARD_ID', 'local')
 REPLICA_ID = os.environ.get('REPLICA_ID', 'local-1')
+SHARD_MAP_PATH = os.environ.get(
+    'SHARD_MAP_PATH',
+    str(BASE_DIR / 'config' / 'shard_map.yaml'),
+)
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
