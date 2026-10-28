@@ -1,3 +1,19 @@
+x-api-common: &api-common
+  build: .
+  env_file: .env
+  volumes:
+    - ./config:/app/config:ro
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 10s
+
 services:
   # ---------------------------------------------------------------------------
   # Shard A: accounts A0001-A1000, independent PostgreSQL instance.
@@ -16,7 +32,7 @@ services:
       timeout: 5s
       retries: 10
 
-  # One-shot schema migration for shard A. Runs before api-a starts.
+  # One-shot schema migration for shard A. Runs before the A replicas start.
   migrate-a:
     build: .
     command: ["python", "manage.py", "migrate", "--noinput"]
@@ -32,9 +48,8 @@ services:
       db-a:
         condition: service_healthy
 
-  api-a:
-    build: .
-    env_file: .env
+  api-a1:
+    <<: *api-common
     environment:
       DB_HOST: db-a
       DB_NAME: banking_a
@@ -42,23 +57,26 @@ services:
       REPLICA_ID: shard-a-1
     ports:
       - "8001:8000"
-    volumes:
-      - ./config:/app/config:ro
     depends_on:
       db-a:
         condition: service_healthy
       migrate-a:
         condition: service_completed_successfully
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+
+  api-a2:
+    <<: *api-common
+    environment:
+      DB_HOST: db-a
+      DB_NAME: banking_a
+      SHARD_ID: shard-a
+      REPLICA_ID: shard-a-2
+    ports:
+      - "8002:8000"
+    depends_on:
+      db-a:
+        condition: service_healthy
+      migrate-a:
+        condition: service_completed_successfully
 
   # ---------------------------------------------------------------------------
   # Shard B: accounts A1001-A2000, independent PostgreSQL instance.
@@ -92,33 +110,35 @@ services:
       db-b:
         condition: service_healthy
 
-  api-b:
-    build: .
-    env_file: .env
+  api-b1:
+    <<: *api-common
     environment:
       DB_HOST: db-b
       DB_NAME: banking_b
       SHARD_ID: shard-b
       REPLICA_ID: shard-b-1
     ports:
-      - "8002:8000"
-    volumes:
-      - ./config:/app/config:ro
+      - "8003:8000"
     depends_on:
       db-b:
         condition: service_healthy
       migrate-b:
         condition: service_completed_successfully
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+
+  api-b2:
+    <<: *api-common
+    environment:
+      DB_HOST: db-b
+      DB_NAME: banking_b
+      SHARD_ID: shard-b
+      REPLICA_ID: shard-b-2
+    ports:
+      - "8004:8000"
+    depends_on:
+      db-b:
+        condition: service_healthy
+      migrate-b:
+        condition: service_completed_successfully
 
 volumes:
   pgdata-a:
