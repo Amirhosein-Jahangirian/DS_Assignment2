@@ -22,7 +22,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-from balancer import ConfigError, GatewayConfig, load_config
+from balancer import ConfigError, GatewayConfig, Replica, load_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,24 +77,34 @@ app = FastAPI(title='Banking Gateway', version='1.0', lifespan=lifespan)
 # ---------------------------------------------------------------------------
 # Health monitoring
 # ---------------------------------------------------------------------------
+async def _probe(
+    replica: Replica,
+    client: httpx.AsyncClient,
+    timeout: float,
+) -> bool:
+    try:
+        response = await client.get(f'{replica.url}/health', timeout=timeout)
+        return response.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
 async def _probe_loop(app: FastAPI) -> None:
     """Probe every replica forever, updating the in-memory health state."""
     config: GatewayConfig = app.state.config
     client: httpx.AsyncClient = app.state.client
 
     while True:
-        for replica in config.all_replicas():
-            try:
-                response = await client.get(
-                    f'{replica.url}/health',
-                    timeout=config.health_timeout,
-                )
-                ok = response.status_code == 200
-            except httpx.HTTPError:
-                ok = False
+        replicas = config.all_replicas()
+        # Probe concurrently so one hung replica does not delay the others.
+        results = await asyncio.gather(
+            *(_probe(replica, client, config.health_timeout) for replica in replicas),
+            return_exceptions=True,
+        )
 
+        for replica, result in zip(replicas, results):
             was_healthy = replica.healthy
-            config.mark(replica, ok)
+            config.mark(replica, result is True)
             if was_healthy != replica.healthy:
                 logger.info(
                     'replica %s (%s) is now %s',

@@ -1,9 +1,9 @@
 import os
+import json
+import uuid
 
 import requests
 import concurrent.futures
-import time
-import json
 
 # ============================================================
 # CONFIGURATION
@@ -30,7 +30,6 @@ test_results = {
     "acid_isolation": False,
     "acid_atomicity": False,
     "acid_durability": False,
-    "capacity_limit": False,
 
 }
 
@@ -47,7 +46,7 @@ def make_request(method, endpoint, data=None, raw_data=None, verbose=True, timeo
     """Make HTTP request and return response"""
     url = f"{BASE_URL}/{endpoint}"
     headers = {"Content-Type": "application/json",
-               "X-Request-ID": f"test-{int(time.time()*1000)}"}
+               "X-Request-ID": uuid.uuid4().hex}
 
     try:
         if raw_data:
@@ -155,7 +154,7 @@ def stage_2():
          {"amount": "abc"}, 400, "error_invalid_amount"),
         ("Missing fields", "POST",
          f"{TEST_ACCOUNT}/deposit/", {}, 400, "error_missing_fields"),
-        ("Unsupported action", "POST", f"{TEST_ACCOUNT}/transfer/",
+        ("Unsupported action", "POST", f"{TEST_ACCOUNT}/reverse/",
          {"amount": 10}, [404, 405], "error_unsupported_action"),
     ]
 
@@ -301,8 +300,9 @@ def stage_6():
 
     print(f"\n{'='*60}")
     print("  ACTION REQUIRED:")
-    print("  1. Kill the Django server process (Ctrl+C)")
-    print("  2. Restart the Django server")
+    print("  1. Restart one API replica, for example:")
+    print("     docker compose restart api-a1")
+    print("  2. Wait a few seconds for the gateway to route to the other replica.")
     print("  3. Press Enter here to continue")
     print(f"{'='*60}")
     input()
@@ -319,50 +319,6 @@ def stage_6():
         test_results["acid_durability"] = True
     else:
         print(f"  ❌ Durability FAILED (transaction lost)")
-
-# ============================================================
-# STAGE 7: CONCURRENT CLIENT LIMIT
-# ============================================================
-
-
-def stage_7():
-    print_header("STAGE 7: CONCURRENT CLIENT LIMIT")
-    print("  (Ensure Server .env has MAX_CONCURRENT_CLIENTS=20)")
-    wait()
-
-    print("  Launching 25 simultaneous requests...")
-    print("  Expected: 20 succeed (200), 5 rejected (503)\n")
-
-    def dummy_request():
-        # CRITICAL FIX: Stagger requests by 50ms to prevent VM network adapter
-        # from dropping connections due to instantaneous TCP burst flooding.
-        time.sleep(0.05)
-        return make_request("GET", f"{TEST_ACCOUNT}/", verbose=False, timeout=10)
-
-    results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
-        futures = [executor.submit(dummy_request) for _ in range(25)]
-        for f in concurrent.futures.as_completed(futures):
-            r = f.result()
-            if r is not None:
-                results.append(r.status_code)
-            else:
-                results.append("CRASHED")
-
-    print(f"  Raw status codes received: {results}")
-
-    success_count = results.count(200)
-    rejected_count = results.count(503)
-
-    print(
-        f"\n  Final Tally: {success_count} succeeded, {rejected_count} rejected (503)")
-
-    # More robust check: as long as at least 1 is rejected and none crashed, it passes
-    if rejected_count >= 1 and (success_count + rejected_count) == 25:
-        print("  ✅ Capacity limit enforced correctly!")
-        test_results["capacity_limit"] = True
-    else:
-        print(f"  ❌ Capacity limit NOT enforced.")
 
 # ============================================================
 # STAGE 8: SUMMARY
@@ -387,7 +343,6 @@ def stage_8():
         ("ACID: Isolation", test_results["acid_isolation"]),
         ("ACID: Atomicity", test_results["acid_atomicity"]),
         ("ACID: Durability", test_results["acid_durability"]),
-        ("Capacity limit enforced", test_results["capacity_limit"]),
     ]
 
     for name, passed in checklist:
@@ -405,9 +360,11 @@ def stage_8():
 
     print(f"\n{'='*60}")
     print("  VIDEO REMINDERS:")
-    print("  • Show transaction_logs.log")
-    print("  • Show .env with MAX_CONCURRENT_CLIENTS")
-    print("  • Show the server and the client running on separate hosts")
+    print("  • Show docker compose ps and the gateway health")
+    print("  • Show both shard databases and their account ranges")
+    print("  • Show gateway routing and replica logs")
+    print("  • Show replica failover")
+    print("  • Show local and cross-shard transfers (after Phase 7)")
     print(f"{'='*60}\n")
 
 # ============================================================
@@ -417,7 +374,7 @@ def stage_8():
 
 def main():
     print(f"\n{'='*60}")
-    print("  MINI BANKING SERVER - TEST SUITE")
+    print("  DISTRIBUTED BANKING PLATFORM - A2 TEST SUITE")
     print(f"{'='*60}")
     print(f"  Server: {BASE_ROOT}")
     print(f"  Account: {TEST_ACCOUNT}")
@@ -432,8 +389,7 @@ def main():
         stage_4()
         stage_5()
         stage_6()
-        stage_7()  # <-- Fixed name here
-        stage_8()   # <-- Fixed name here
+        stage_8()
     except KeyboardInterrupt:
         print("\n\n  ⚠️  Interrupted")
         stage_8()

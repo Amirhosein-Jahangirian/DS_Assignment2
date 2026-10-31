@@ -3,6 +3,10 @@ Gateway configuration, shard resolution, and replica health/selection state.
 
 The gateway reads the same shard map as the banking servers. The map decides
 ownership; gateway.yaml decides which replica URLs exist for each shard.
+
+Replica selection is per-shard round-robin over replicas currently marked
+healthy. A replica is ejected after two consecutive failed probes and rejoins
+after three consecutive successful probes.
 """
 from __future__ import annotations
 

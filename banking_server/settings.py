@@ -158,8 +158,8 @@ REST_FRAMEWORK = {
 }
 
 SPECTACULAR_SETTINGS = {
-    'TITLE': 'Mini Banking Transaction Server API',
-    'DESCRIPTION': 'Distributed Systems Assignment 1',
+    'TITLE': 'Distributed Banking Platform API',
+    'DESCRIPTION': 'Distributed Systems Assignment 2 - sharding, replication, and 2PC',
     'VERSION': '1.0.0',
 }
 

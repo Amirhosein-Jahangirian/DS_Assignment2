@@ -154,13 +154,13 @@ services:
       - "8000:8000"
     depends_on:
       api-a1:
-        condition: service_healthy
+        condition: service_started
       api-a2:
-        condition: service_healthy
+        condition: service_started
       api-b1:
-        condition: service_healthy
+        condition: service_started
       api-b2:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test:
         - CMD

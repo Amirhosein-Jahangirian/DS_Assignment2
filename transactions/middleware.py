@@ -25,10 +25,8 @@ class TransactionLoggingMiddleware(MiddlewareMixin):
         
         # --- Concurrent Client Limiting (Section 2.1) ---
         with _request_lock:
-            print(f"[DEBUG] Active requests: {_active_requests} / Max: {settings.MAX_CONCURRENT_CLIENTS}")
 
             if _active_requests >= settings.MAX_CONCURRENT_CLIENTS:
-                print(f"[DEBUG] ❌ REJECTING request (Limit reached!)")
                 # Server is at capacity, reject the request
                 request._counter_incremented = False  # Mark that we didn't increment
                 return HttpResponse(
@@ -37,7 +35,6 @@ class TransactionLoggingMiddleware(MiddlewareMixin):
                 )
             _active_requests += 1
             request._counter_incremented = True  # Mark that we did increment
-            print(f"[DEBUG] ✅ ACCEPTED request. New count: {_active_requests}")
 
         # Start timer for latency calculation
         request.start_time = time.time()
