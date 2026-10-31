@@ -55,8 +55,8 @@ services:
       DB_NAME: banking_a
       SHARD_ID: shard-a
       REPLICA_ID: shard-a-1
-    ports:
-      - "8001:8000"
+    expose:
+      - "8000"
     depends_on:
       db-a:
         condition: service_healthy
@@ -70,8 +70,8 @@ services:
       DB_NAME: banking_a
       SHARD_ID: shard-a
       REPLICA_ID: shard-a-2
-    ports:
-      - "8002:8000"
+    expose:
+      - "8000"
     depends_on:
       db-a:
         condition: service_healthy
@@ -117,8 +117,8 @@ services:
       DB_NAME: banking_b
       SHARD_ID: shard-b
       REPLICA_ID: shard-b-1
-    ports:
-      - "8003:8000"
+    expose:
+      - "8000"
     depends_on:
       db-b:
         condition: service_healthy
@@ -132,13 +132,45 @@ services:
       DB_NAME: banking_b
       SHARD_ID: shard-b
       REPLICA_ID: shard-b-2
-    ports:
-      - "8004:8000"
+    expose:
+      - "8000"
     depends_on:
       db-b:
         condition: service_healthy
       migrate-b:
         condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  # Gateway: the only client-facing entry point. Resolves accounts to shards
+  # and load-balances over healthy replicas of the owning shard.
+  # ---------------------------------------------------------------------------
+  gateway:
+    build: ./gateway
+    environment:
+      CONFIG_DIR: /app/config
+    volumes:
+      - ./config:/app/config:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      api-a1:
+        condition: service_healthy
+      api-a2:
+        condition: service_healthy
+      api-b1:
+        condition: service_healthy
+      api-b2:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
 volumes:
   pgdata-a:

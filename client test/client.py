@@ -9,10 +9,11 @@ import json
 # CONFIGURATION
 # ============================================================
 # Read from the environment so the client can target a local server,
-# another host, or (later) the gateway.
+# another host, or the gateway. The gateway is the normal entry point.
 SERVER_HOST = os.environ.get("BANK_SERVER_HOST", "127.0.0.1")
 SERVER_PORT = os.environ.get("BANK_SERVER_PORT", "8000")
-BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}/api/accounts"
+BASE_ROOT = f"http://{SERVER_HOST}:{SERVER_PORT}"
+BASE_URL = f"{BASE_ROOT}/api/accounts"
 TEST_ACCOUNT = os.environ.get("BANK_TEST_ACCOUNT", "A1001")
 
 # Track test results
@@ -86,11 +87,20 @@ def stage_0():
     print_header("STAGE 0: CONNECTION TEST")
     wait()
 
-    response = make_request("GET", "")
-    if response and response.status_code == 200:
-        print("  ✅ Server reachable")
-        test_results["connection"] = True
-    else:
+    url = f"{BASE_ROOT}/health"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            print(f"  ✅ Gateway reachable ({url})")
+            try:
+                print(f"       {json.dumps(response.json())}")
+            except ValueError:
+                pass
+            test_results["connection"] = True
+        else:
+            print(f"  ❌ Gateway returned {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        print(f"  [!] REQUEST FAILED: {type(e).__name__} - {e}")
         print("  ❌ Server NOT reachable")
 
 # ============================================================
@@ -409,7 +419,7 @@ def main():
     print(f"\n{'='*60}")
     print("  MINI BANKING SERVER - TEST SUITE")
     print(f"{'='*60}")
-    print(f"  Server: {BASE_URL}")
+    print(f"  Server: {BASE_ROOT}")
     print(f"  Account: {TEST_ACCOUNT}")
 
     wait()

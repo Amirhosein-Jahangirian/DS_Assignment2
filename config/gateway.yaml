@@ -1,0 +1,22 @@
+replicas:
+  shard-a:
+    - id: shard-a-1
+      url: http://api-a1:8000
+    - id: shard-a-2
+      url: http://api-a2:8000
+  shard-b:
+    - id: shard-b-1
+      url: http://api-b1:8000
+    - id: shard-b-2
+      url: http://api-b2:8000
+
+health:
+  # Active probing of every replica. Two consecutive failures mark a replica
+  # unhealthy; three consecutive successes bring it back.
+  interval_seconds: 2
+  timeout_seconds: 1
+  failures_to_unhealthy: 2
+  successes_to_healthy: 3
+
+# Timeout for a proxied banking request.
+request_timeout_seconds: 5
