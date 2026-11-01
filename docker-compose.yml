@@ -147,18 +147,50 @@ services:
         condition: service_completed_successfully
 
   # ---------------------------------------------------------------------------
+  # Coordinator decision log. Deliberately separate from both shards: a
+  # recorded COMMIT must still be readable when a shard is down.
+  # ---------------------------------------------------------------------------
+  coord-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: banking_coord
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pgdata-coord:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d banking_coord"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
   # Gateway: the only client-facing entry point. Resolves accounts to shards
-  # and load-balances over healthy replicas of the owning shard.
+  # and load-balances over healthy replicas of the owning shard. Also hosts
+  # the 2PC coordinator; its decision log lives in coord-db.
   # ---------------------------------------------------------------------------
   gateway:
     build: ./gateway
     environment:
       CONFIG_DIR: /app/config
+      COORD_DB_HOST: coord-db
+      COORD_DB_PORT: "5432"
+      COORD_DB_NAME: banking_coord
+      COORD_DB_USER: ${DB_USER}
+      COORD_DB_PASSWORD: ${DB_PASSWORD}
+      COORD_RPC_TIMEOUT_SECONDS: ${COORD_RPC_TIMEOUT_SECONDS:-6}
+      COORD_RPC_ATTEMPTS: ${COORD_RPC_ATTEMPTS:-2}
+      COORD_RECOVERY_INTERVAL_SECONDS: ${COORD_RECOVERY_INTERVAL_SECONDS:-5}
+      COORD_PREPARING_GRACE_SECONDS: ${COORD_PREPARING_GRACE_SECONDS:-12}
+      COORD_TEST_PAUSE_AFTER_PREPARE_SECONDS: ${COORD_TEST_PAUSE_AFTER_PREPARE_SECONDS:-0}
+      COORD_TEST_PAUSE_AFTER_DECISION_SECONDS: ${COORD_TEST_PAUSE_AFTER_DECISION_SECONDS:-0}
     volumes:
       - ./config:/app/config:ro
     ports:
       - "8000:8000"
     depends_on:
+      coord-db:
+        condition: service_healthy
       api-a1:
         condition: service_started
       api-a2:
@@ -181,3 +213,4 @@ services:
 volumes:
   pgdata-a:
   pgdata-b:
+  pgdata-coord:

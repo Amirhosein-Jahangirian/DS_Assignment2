@@ -23,6 +23,7 @@ from typing import Any
 
 import psycopg2
 from django.conf import settings
+from psycopg2 import errors as pg_errors
 from psycopg2 import sql
 
 from .models import Account, ParticipantCommit
@@ -161,6 +162,18 @@ def prepare(
 
             try:
                 cursor.execute('BEGIN')
+                # A prepare must never outlive the coordinator's RPC timeout.
+                # If the account row is busy, vote NO instead of waiting
+                # indefinitely; recovery could otherwise roll back a GID before
+                # this prepare finishes and leave an orphaned prepared xact.
+                cursor.execute(
+                    "SELECT set_config('lock_timeout', %s, true)",
+                    (f'{settings.PREPARE_LOCK_TIMEOUT_MS}ms',),
+                )
+                cursor.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (f'{settings.PREPARE_STATEMENT_TIMEOUT_MS}ms',),
+                )
                 cursor.execute(
                     sql.SQL(
                         'SELECT balance FROM {} '
@@ -211,6 +224,42 @@ def prepare(
                 cursor.execute(
                     sql.SQL('PREPARE TRANSACTION {}').format(sql.Literal(gid))
                 )
+            except pg_errors.LockNotAvailable:
+                _rollback_quietly(cursor)
+                logger.info(
+                    'prepare lock timeout  gid=%s  account=%s  shard=%s',
+                    gid,
+                    account_number,
+                    settings.SHARD_ID,
+                )
+                return {
+                    'gid': gid,
+                    'vote': 'NO',
+                    'status': 'ABORTED',
+                    'error_code': 'LOCK_TIMEOUT',
+                    'message': (
+                        f'Account {account_number} is busy; the participant '
+                        'could not acquire its lock in time'
+                    ),
+                }
+            except pg_errors.QueryCanceled:
+                _rollback_quietly(cursor)
+                logger.warning(
+                    'prepare statement timeout  gid=%s  account=%s  shard=%s',
+                    gid,
+                    account_number,
+                    settings.SHARD_ID,
+                )
+                return {
+                    'gid': gid,
+                    'vote': 'NO',
+                    'status': 'ABORTED',
+                    'error_code': 'PREPARE_TIMEOUT',
+                    'message': (
+                        f'The participant could not prepare {account_number} '
+                        'within the statement timeout'
+                    ),
+                }
             except Exception:
                 _rollback_quietly(cursor)
                 raise

@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 
 from pathlib import Path
 import os
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 
@@ -21,6 +22,26 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / '.env')
 
 MAX_CONCURRENT_CLIENTS = int(os.environ.get('MAX_CONCURRENT_CLIENTS', '100'))
+
+# Bounds for a participant PREPARE. The coordinator's RPC timeout must be
+# longer than PREPARE_STATEMENT_TIMEOUT_MS: after a timeout the coordinator
+# queries the participant state, and this bound guarantees that no prepare is
+# still running when a rollback is sent. Without it a blocked prepare could
+# outlive the coordinator's timeout and leave an orphaned prepared xact.
+PREPARE_LOCK_TIMEOUT_MS = int(os.environ.get('PREPARE_LOCK_TIMEOUT_MS', '2000'))
+PREPARE_STATEMENT_TIMEOUT_MS = int(
+    os.environ.get('PREPARE_STATEMENT_TIMEOUT_MS', '4000')
+)
+if (
+    PREPARE_LOCK_TIMEOUT_MS <= 0
+    or PREPARE_STATEMENT_TIMEOUT_MS <= 0
+    or PREPARE_STATEMENT_TIMEOUT_MS < PREPARE_LOCK_TIMEOUT_MS
+):
+    raise ImproperlyConfigured(
+        'PREPARE_LOCK_TIMEOUT_MS and PREPARE_STATEMENT_TIMEOUT_MS must be '
+        'positive, and the statement timeout must not be shorter than the '
+        'lock timeout'
+    )
 
 # Identity of this process, used in logs and response headers. They are
 # overridden per container once shards and replicas exist (Phase 3/4).
