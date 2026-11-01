@@ -20,6 +20,9 @@ services:
   # ---------------------------------------------------------------------------
   db-a:
     image: postgres:16-alpine
+    # Two-phase commit requires prepared transactions. The default is 0, which
+    # silently rejects PREPARE TRANSACTION.
+    command: ["postgres", "-c", "max_prepared_transactions=64"]
     environment:
       POSTGRES_DB: banking_a
       POSTGRES_USER: ${DB_USER}
@@ -83,6 +86,9 @@ services:
   # ---------------------------------------------------------------------------
   db-b:
     image: postgres:16-alpine
+    # Two-phase commit requires prepared transactions. The default is 0, which
+    # silently rejects PREPARE TRANSACTION.
+    command: ["postgres", "-c", "max_prepared_transactions=64"]
     environment:
       POSTGRES_DB: banking_b
       POSTGRES_USER: ${DB_USER}

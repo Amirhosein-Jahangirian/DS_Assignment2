@@ -17,6 +17,13 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path, include
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
+from transactions.internal_views import (
+    LocalTransferView,
+    ParticipantCommitView,
+    ParticipantPrepareView,
+    ParticipantRollbackView,
+    ParticipantStatusView,
+)
 from transactions.views import health
 
 urlpatterns = [
@@ -28,4 +35,12 @@ urlpatterns = [
     # Container/gateway probe. Not under /api/ on purpose (no transaction-log noise).
     path('health', health, name='health'),
     path('health/', health),
+
+    # Internal shard API. Not exposed by the gateway and not published on the
+    # host; only replicas and the coordinator on the Docker network use it.
+    path('internal/transfers/local/', LocalTransferView.as_view(), name='internal_local_transfer'),
+    path('internal/2pc/prepare/', ParticipantPrepareView.as_view(), name='internal_2pc_prepare'),
+    path('internal/2pc/commit/', ParticipantCommitView.as_view(), name='internal_2pc_commit'),
+    path('internal/2pc/rollback/', ParticipantRollbackView.as_view(), name='internal_2pc_rollback'),
+    path('internal/2pc/prepared/<path:gid>/', ParticipantStatusView.as_view(), name='internal_2pc_prepared'),
 ]
