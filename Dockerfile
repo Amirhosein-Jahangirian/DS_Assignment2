@@ -17,15 +17,26 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=app:app . .
 
-# WORKDIR created /app as root before the copy; hand the directory to app.
-RUN chown app:app /app
+# Collect DRF/admin static assets for WhiteNoise. Gunicorn does not serve
+# static files itself, and runserver is intentionally not used in containers.
+# One gthread worker keeps the in-process admission counter accurate. The
+# thread pool must exceed MAX_CONCURRENT_CLIENTS with headroom: a 2PC prepare
+# can wait on a hot row, and a commit that releases that row must never queue
+# behind blocked prepares.
+# App startup validates SHARD_ID against the shard map, so give collectstatic
+# a valid placeholder owner; the collected assets are shard-independent.
+RUN SHARD_ID=shard-a python manage.py collectstatic --noinput \
+    && chown -R app:app /app
 
 USER app
 
 EXPOSE 8000
 
-# Django's development server. Its built-in static handler serves the DRF
-# browsable API and Django admin assets (available while DEBUG=True, which is
-# the current setting). --noreload keeps one process so the in-process
-# admission counter stays accurate.
-CMD ["python", "manage.py", "runserver", "0.0.0.0:8000", "--noreload"]
+CMD ["gunicorn", "banking_server.wsgi:application", \
+     "--bind", "0.0.0.0:8000", \
+     "--workers", "1", \
+     "--threads", "48", \
+     "--worker-class", "gthread", \
+     "--timeout", "60", \
+     "--graceful-timeout", "30", \
+     "--log-level", "info"]

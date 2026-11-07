@@ -20,4 +20,6 @@ USER app
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Access logs are disabled: the gateway already emits structured request
+# logs, and the Docker healthcheck hits /health every few seconds.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

@@ -28,9 +28,9 @@ MAX_CONCURRENT_CLIENTS = int(os.environ.get('MAX_CONCURRENT_CLIENTS', '100'))
 # queries the participant state, and this bound guarantees that no prepare is
 # still running when a rollback is sent. Without it a blocked prepare could
 # outlive the coordinator's timeout and leave an orphaned prepared xact.
-PREPARE_LOCK_TIMEOUT_MS = int(os.environ.get('PREPARE_LOCK_TIMEOUT_MS', '2000'))
+PREPARE_LOCK_TIMEOUT_MS = int(os.environ.get('PREPARE_LOCK_TIMEOUT_MS', '4000'))
 PREPARE_STATEMENT_TIMEOUT_MS = int(
-    os.environ.get('PREPARE_STATEMENT_TIMEOUT_MS', '4000')
+    os.environ.get('PREPARE_STATEMENT_TIMEOUT_MS', '5000')
 )
 if (
     PREPARE_LOCK_TIMEOUT_MS <= 0
@@ -87,6 +87,9 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # Serves the DRF browsable API and admin assets under gunicorn, where
+    # Django's runserver static handler is not available.
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -166,7 +169,20 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+# WhiteNoise serves the collected DRF/admin assets in production-style
+# deployments. CompressedStaticFilesStorage avoids a manifest, so a missing
+# optional asset cannot break template rendering.
+STORAGES = {
+    'default': {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'whitenoise.storage.CompressedStaticFilesStorage',
+    },
+}
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
