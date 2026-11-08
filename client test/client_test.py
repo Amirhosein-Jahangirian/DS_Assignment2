@@ -6,20 +6,14 @@ transfer goes through the Gateway on port 8000. Docker and psql are used only
 to observe the stack (ownership ranges, replica health, prepared transactions
 and the coordinator log), never to route client traffic.
 
-Experiments
-    1. Data distribution and request routing
-    2. Load distribution across replicas
-    3. Concurrent operations through both replicas
-    4. Replica failure and failover
-    5. Local and cross-shard transfers
-    6. Interrupted distributed transaction (2PC recovery)
-    7. Concurrent cross-shard and local transfers
+Each experiment reports one final PASS/FAIL result. The internal assertions
+are still evaluated; set BANK_TEST_VERBOSE=1 to print them individually.
 
 Usage:
     python "client test/client_test.py"
 
 Press Enter at each prompt to run the next experiment. Exit code is 0 only
-when every check passes.
+when every experiment passes.
 """
 import json
 import os
@@ -33,6 +27,10 @@ from decimal import Decimal
 from pathlib import Path
 
 import requests
+
+VERBOSE = os.environ.get("BANK_TEST_VERBOSE", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
 # ============================================================
 # CONFIGURATION
@@ -99,60 +97,101 @@ EXPERIMENT_TITLES = {
     7: "Concurrent cross-shard and local transfers",
 }
 
+EXPERIMENT_GOALS = {
+    1: "each shard owns one account range and the Gateway resolves ownership.",
+    2: "reads for one account split evenly across both replicas of its shard.",
+    3: "concurrent writes through both replicas preserve every update.",
+    4: "a failed replica is detected and traffic moves to the healthy replica.",
+    5: "local transfers use one database; cross-shard transfers use 2PC.",
+    6: "a durable COMMIT survives a Gateway stop and recovers exactly once.",
+    7: "concurrent transfers complete, conserve money, and leave no 2PC state.",
+}
+
 # ============================================================
 # RESULT TRACKING
 # ============================================================
 class Results:
+    """Evaluate every assertion but report one result per experiment."""
+
     def __init__(self):
+        self.current = None
+        self.assertions = []
         self.total = 0
         self.failed = 0
-        self.current = None
         self.records = {}
 
     def begin(self, number):
         self.current = number
-        self.records.setdefault(number, [0, 0])
+        self.assertions = []
 
     def check(self, name, condition, detail=None):
+        passed = bool(condition)
         self.total += 1
-        passed, total = self.records.setdefault(self.current, [0, 0])
-        self.records[self.current] = [passed + 1, total + 1]
-        if condition:
-            print(f"  [PASS]  {name}")
-        else:
+        if not passed:
             self.failed += 1
-            suffix = f"  ({_detail(detail)})" if detail is not None else ""
-            print(f"  [FAIL]  {name}{suffix}")
-        return bool(condition)
+        self.assertions.append((name, passed, detail))
+        if VERBOSE:
+            mark = "ok" if passed else "FAIL"
+            suffix = ""
+            if not passed and detail is not None:
+                suffix = f"  {_detail(detail)}"
+            print(f"      {mark:<4}  {name}{suffix}")
+        return passed
+
+    def finish(self, number, elapsed):
+        failed = [item for item in self.assertions if not item[1]]
+        ok = bool(self.assertions) and not failed
+        self.records[number] = {
+            "ok": ok,
+            "elapsed": elapsed,
+            "assertions": len(self.assertions),
+            "failed": len(failed),
+        }
+
+        print(f"\n  Result: {'PASS' if ok else 'FAIL'}  ({elapsed:.1f}s)")
+        if not ok:
+            if not self.assertions:
+                print("    No assertions were recorded.")
+            for name, _, detail in failed[:6]:
+                print(f"    Failed assertion: {name}")
+                if detail is not None:
+                    print(f"      {_detail(detail)}")
+            if len(failed) > 6:
+                print(f"    ... and {len(failed) - 6} more failed assertions")
+        return ok
 
     def abort(self, number, exc):
-        self.begin(number)
         self.check(
-            f"E{number} experiment completed without errors",
+            "experiment completed without errors",
             False,
             f"{type(exc).__name__}: {exc}",
         )
 
     @property
     def ok(self):
-        return self.total > 0 and self.failed == 0
+        return bool(self.records) and all(
+            record["ok"] for record in self.records.values()
+        )
 
 
 def _detail(value, limit=300):
     if isinstance(value, dict):
-        text = json.dumps(value, default=str, sort_keys=True)
+        text = ", ".join(f"{key}={value[key]}" for key in value)
+    elif isinstance(value, (tuple, list)):
+        text = ", ".join(str(item) for item in value)
     else:
         text = str(value)
     return text if len(text) <= limit else text[:limit] + "..."
 
 
 def print_header(title):
-    print(f"\n{'=' * 68}\n  {title}\n{'=' * 68}")
+    print(f"\n{'=' * 70}\n  {title}\n{'=' * 70}")
 
 
-def wait():
+def wait(prompt="\nPress Enter to continue..."):
     try:
-        input("\nPress Enter to continue...")
+        input(prompt)
+        print()
     except EOFError:
         print()
 
@@ -200,7 +239,7 @@ def post_action(account, action, amount, timeout=60):
         return None
 
 
-def post_transfer(from_account, to_account, amount, timeout=180):
+def post_transfer(from_account, to_account, amount, timeout=180, quiet=False):
     payload = {
         "from_account": from_account,
         "to_account": to_account,
@@ -211,7 +250,8 @@ def post_transfer(from_account, to_account, amount, timeout=180):
             f"{BASE_ROOT}/api/transfers/", json=payload, timeout=timeout
         )
     except requests.exceptions.RequestException as exc:
-        print(f"  [!] transfer request failed: {type(exc).__name__}: {exc}")
+        if not quiet:
+            print(f"  [!] transfer request failed: {type(exc).__name__}: {exc}")
         return None
 
 
@@ -366,52 +406,41 @@ def output_tail(process, limit=300):
 # EXPERIMENT 1: DATA DISTRIBUTION AND REQUEST ROUTING
 # ============================================================
 def experiment_1(results):
-    results.begin(1)
-    print_header("EXPERIMENT 1: DATA DISTRIBUTION AND REQUEST ROUTING")
-    print("  Each shard owns a contiguous account range and its own database.")
-    print("  The client only knows account numbers: the Gateway resolves the")
-    print("  owner and returns X-Shard and X-Served-By for observability.\n")
-    wait()
-
-    summaries = {}
+    print("  Database ownership")
     for shard, (service, database), low, high in (
         ("shard-a", DATABASES["shard-a"], "A0001", "A1000"),
         ("shard-b", DATABASES["shard-b"], "A1001", "A2000"),
     ):
-        print(f"  Database behind {shard} ({database}):")
         try:
             summary = shard_summary(service, database, low, high)
-            summaries[shard] = summary
             count, lowest, highest, outside = summary
             print(
-                f"    accounts={count}  min={lowest}  max={highest}  "
-                f"outside-range={outside}"
+                f"    {shard}   {count} rows   {lowest}..{highest}   "
+                f"{outside} outside range"
             )
         except Exception as exc:  # noqa: BLE001 - report instead of aborting
-            summaries[shard] = None
-            print(f"    [!] {type(exc).__name__}: {exc}")
+            summary = None
+            print(f"    {shard}   [!] {type(exc).__name__}: {exc}")
 
-        summary = summaries[shard]
         results.check(
-            f"E1 {shard} stores exactly 1000 accounts",
+            f"{shard} stores exactly 1000 accounts",
             summary is not None and summary[0] == 1000,
             summary,
         )
         results.check(
-            f"E1 {shard} covers {low}..{high}",
+            f"{shard} covers {low}..{high}",
             summary is not None
             and summary[1] == low
             and summary[2] == high,
             summary,
         )
         results.check(
-            f"E1 {shard} owns no out-of-range account",
+            f"{shard} owns no out-of-range account",
             summary is not None and summary[3] == 0,
             summary,
         )
-        print()
 
-    print("  Routing checks through the Gateway (no shard chosen by the client):")
+    print("\n  Gateway routing")
     routes = (
         (ROUTE_A, "shard-a"),
         (ROUTE_A_EDGE, "shard-a"),
@@ -420,43 +449,46 @@ def experiment_1(results):
     )
     for account, expected in routes:
         response = get_account(account)
-        body = body_of(response)
+        routed = (
+            response.headers.get("x-shard", "") if response is not None else ""
+        )
         served_by = (
             response.headers.get("x-served-by", "") if response is not None else ""
         )
-        routed = response is not None and response.headers.get("x-shard", "")
-        print(
-            f"    {account}: status="
-            f"{response.status_code if response is not None else 'no-response'} "
-            f"shard={routed or '-'} served-by={served_by or '-'} "
-            f"balance={body.get('balance', '-')}"
-        )
+        status = response.status_code if response is not None else "no-response"
+        extra = "" if status == 200 else f"   (HTTP {status})"
+        print(f"    {account} -> {routed or '-'} / {served_by or '-'}{extra}")
         results.check(
-            f"E1 {account} is routed to {expected}",
+            f"{account} is routed to {expected}",
             response is not None
             and response.status_code == 200
             and routed == expected
             and served_by.startswith(f"{expected}-"),
-            (routed, served_by, body),
+            f"got {routed or '-'} / {served_by or '-'}",
         )
 
     response = get_account(UNKNOWN_ACCOUNT)
     body = body_of(response)
+    status = response.status_code if response is not None else "no-response"
+    print(f"    {UNKNOWN_ACCOUNT} -> {status} {body.get('error_code', '-')}")
     results.check(
-        f"E1 unowned account {UNKNOWN_ACCOUNT} is rejected",
+        f"unowned account {UNKNOWN_ACCOUNT} is rejected",
         response is not None
         and response.status_code == 404
         and body.get("error_code") == "UNKNOWN_ACCOUNT",
-        (response.status_code if response is not None else None, body),
+        (status, body.get("error_code", "-")),
     )
 
     health = health_body()
+    replicas_a = healthy_replicas(health or {}, "shard-a")
+    replicas_b = healthy_replicas(health or {}, "shard-b")
+    print("\n  Replica health")
+    print(f"    shard-a: {', '.join(replicas_a) or '-'}")
+    print(f"    shard-b: {', '.join(replicas_b) or '-'}")
     results.check(
-        "E1 the Gateway reports two healthy replicas per shard",
-        health is not None
-        and len(healthy_replicas(health, "shard-a")) == 2
-        and len(healthy_replicas(health, "shard-b")) == 2,
-        health.get("shards") if health else None,
+        "the Gateway reports two healthy replicas per shard",
+        len(replicas_a) == 2 and len(replicas_b) == 2,
+        (len(replicas_a), len(replicas_b)),
     )
 
 
@@ -464,15 +496,8 @@ def experiment_1(results):
 # EXPERIMENT 2: LOAD DISTRIBUTION ACROSS REPLICAS
 # ============================================================
 def experiment_2(results):
-    results.begin(2)
-    print_header("EXPERIMENT 2: LOAD DISTRIBUTION ACROSS REPLICAS")
-    print("  Repeated reads for one account are served by both replicas of")
-    print("  the owning shard. Round-robin selection should split the reads")
-    print("  evenly; the other shard must never be used.\n")
-    wait()
-
+    print("  Replica selection")
     for shard, account in (("shard-a", LOAD_A), ("shard-b", LOAD_B)):
-        print(f"  {LOAD_READS} reads of {account} (owner: {shard}):")
         statuses = Counter()
         served = Counter()
         wrong_shard = 0
@@ -487,19 +512,24 @@ def experiment_2(results):
                 if response.headers.get("x-shard") != shard:
                     wrong_shard += 1
 
-        for replica, count in sorted(served.items()):
-            print(f"    {replica}: {count}")
-        print(f"    statuses: {dict(statuses)}")
+        split = "   ".join(
+            f"{replica}={count}" for replica, count in sorted(served.items())
+        )
+        extra = f"   wrong-shard={wrong_shard}" if wrong_shard else ""
+        print(
+            f"    {shard}   {account}   {statuses.get(200, 0)}/{LOAD_READS} OK"
+            f"   {split}{extra}"
+        )
 
         results.check(
-            f"E2 {shard} reads all succeed",
+            f"{shard} reads all succeed",
             statuses.get(200) == LOAD_READS,
             dict(statuses),
         )
         results.check(
-            f"E2 {shard} reads stay on the owning shard",
+            f"{shard} reads stay on the owning shard",
             wrong_shard == 0,
-            f"{wrong_shard} wrong responses",
+            wrong_shard,
         )
         expected_replicas = {f"{shard}-1", f"{shard}-2"}
         evenly_split = (
@@ -507,11 +537,10 @@ def experiment_2(results):
             and max(served.values()) - min(served.values()) <= 1
         )
         results.check(
-            f"E2 {shard} reads are split across both replicas",
+            f"{shard} reads are split across both replicas",
             evenly_split,
             dict(served),
         )
-        print()
 
 
 # ============================================================
@@ -526,12 +555,6 @@ def run_concurrent_ops(results, shard, account):
     expected_net = (
         OPS_DEPOSITS * OPS_DEPOSIT_AMOUNT
         - OPS_WITHDRAWALS * OPS_WITHDRAW_AMOUNT
-    )
-
-    print(
-        f"  {len(tasks)} concurrent operations on {account}: "
-        f"{OPS_DEPOSITS} deposits of {OPS_DEPOSIT_AMOUNT} and "
-        f"{OPS_WITHDRAWALS} withdrawals of {OPS_WITHDRAW_AMOUNT}"
     )
 
     with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
@@ -553,21 +576,26 @@ def run_concurrent_ops(results, shard, account):
     )
     after = require_balance(account)
 
-    print(f"    statuses: {dict(statuses)}   replicas: {dict(served)}")
-    print(f"    balance: {before} -> {after} (expected {before + expected_net})")
+    split = "   ".join(
+        f"{replica}={count}" for replica, count in sorted(served.items())
+    )
+    print(
+        f"    {shard}   {account}   {statuses.get(200, 0)}/{len(tasks)} OK"
+        f"   {split}"
+    )
 
     results.check(
-        f"E3 {shard} concurrent operations all succeed",
+        f"{shard} concurrent operations all succeed",
         statuses.get(200) == len(tasks),
         dict(statuses),
     )
     results.check(
-        f"E3 {shard} concurrent operations use both replicas",
+        f"{shard} concurrent operations use both replicas",
         len(served) == 2,
         dict(served),
     )
     results.check(
-        f"E3 {shard} concurrent updates produce the serialized balance",
+        f"{shard} concurrent updates produce the serialized balance",
         after == before + expected_net,
         (before, after, before + expected_net),
     )
@@ -579,25 +607,21 @@ def run_concurrent_ops(results, shard, account):
     elif applied < 0:
         restore = post_action(account, "deposit", f"{-applied:.2f}")
     restored = require_balance(account)
+    print(
+        f"              balance {before} -> {after}"
+        f"   restored {restored}"
+    )
     results.check(
-        f"E3 {shard} balance is restored after the experiment",
+        f"{shard} balance is restored after the experiment",
         restored == before,
         (restored, before, applied),
     )
     if restore is not None and restore.status_code != 200:
-        print(f"  [!] restore on {account} returned {restore.status_code}")
-    print()
+        print(f"    [!] restore on {account} returned {restore.status_code}")
 
 
 def experiment_3(results):
-    results.begin(3)
-    print_header("EXPERIMENT 3: CONCURRENT OPERATIONS THROUGH BOTH REPLICAS")
-    print("  Deposits and withdrawals run concurrently through the Gateway.")
-    print("  Both replicas of a shard process writes, and database row locks")
-    print("  must serialize them without losing an update. Each balance is")
-    print("  checked against the exact expected net effect.\n")
-    wait()
-
+    print("  Concurrent writes")
     run_concurrent_ops(results, "shard-a", OPS_A)
     run_concurrent_ops(results, "shard-b", OPS_B)
 
@@ -606,43 +630,31 @@ def experiment_3(results):
 # EXPERIMENT 4: REPLICA FAILURE AND FAILOVER
 # ============================================================
 def experiment_4(results):
-    results.begin(4)
-    print_header("EXPERIMENT 4: REPLICA FAILURE AND FAILOVER")
-    print(f"  One shard-B replica ({FAILOVER_REPLICA}) is stopped. The Gateway")
-    print("  must mark it unhealthy and send every shard-B request to the")
-    print("  remaining replica. Shard-A traffic must be unaffected. The")
-    print("  replica is started again at the end, even if the test fails.\n")
-    print(
-        f"  ACTION: this script will stop {FAILOVER_SERVICE}, run the checks, "
-        "and restart it."
-    )
-    wait()
-
-    stopped = False
+    print("  Replica failure")
+    print(f"    stopping {FAILOVER_SERVICE} ...")
     try:
         process = compose("stop", FAILOVER_SERVICE)
+        if process.returncode != 0:
+            print(f"    [!] stop failed: {output_tail(process)}")
         results.check(
-            "E4 replica stop command succeeded",
+            "replica stop command succeeded",
             process.returncode == 0,
             output_tail(process),
         )
-        stopped = process.returncode == 0
-        if stopped:
-            print(f"  {FAILOVER_SERVICE} stopped; waiting for health detection ...")
 
         detected = poll_health(
             lambda body: healthy_replicas(body, FAILOVER_SHARD)
             == [HEALTHY_REPLICA],
             timeout=90,
         )
+        healthy = healthy_replicas(
+            detected or health_body() or {}, FAILOVER_SHARD
+        )
+        print(f"    shard-b healthy: {', '.join(healthy) or '-'}")
         results.check(
-            "E4 Gateway detects the failed replica",
+            "Gateway detects the failed replica",
             detected is not None,
-            (
-                healthy_replicas(health_body() or {}, FAILOVER_SHARD)
-                if detected is None
-                else detected.get("shards", {}).get(FAILOVER_SHARD)
-            ),
+            healthy,
         )
 
         reads = [get_account(FAILOVER_ACCOUNT) for _ in range(10)]
@@ -655,60 +667,62 @@ def experiment_4(results):
             response.status_code if response is not None else "no-response"
             for response in reads
         )
-        print(f"  10 reads of {FAILOVER_ACCOUNT}: {dict(statuses)} {dict(served)}")
+        served_text = "   ".join(
+            f"{replica}={count}" for replica, count in sorted(served.items())
+        )
+        print(
+            f"    shard-B reads: {statuses.get(200, 0)}/{len(reads)} OK"
+            f"   served by {served_text or '-'}"
+        )
         results.check(
-            "E4 shard-B reads all succeed during the outage",
+            "shard-B reads all succeed during the outage",
             statuses.get(200) == len(reads),
             dict(statuses),
         )
         results.check(
-            "E4 shard-B reads all go to the healthy replica",
+            "shard-B reads all go to the healthy replica",
             set(served) == {HEALTHY_REPLICA},
             dict(served),
         )
 
         other = [get_account(FAILOVER_OTHER) for _ in range(4)]
-        other_ok = all(
-            response is not None
-            and response.status_code == 200
-            and response.headers.get("x-shard") == "shard-a"
-            for response in other
-        )
-        other_served = Counter(
-            response.headers.get("x-served-by", "(none)")
+        other_ok = sum(
+            1
             for response in other
             if response is not None
+            and response.status_code == 200
+            and response.headers.get("x-shard") == "shard-a"
         )
-        print(f"  4 reads of {FAILOVER_OTHER}: {dict(other_served)}")
+        print(f"    shard-A reads: {other_ok}/{len(other)} OK   unaffected")
         results.check(
-            "E4 shard-A traffic is unaffected by the shard-B outage",
-            other_ok,
-            dict(other_served),
+            "shard-A traffic is unaffected by the shard-B outage",
+            other_ok == len(other),
+            f"{other_ok}/{len(other)}",
         )
     finally:
-        print(f"  starting {FAILOVER_SERVICE} again ...")
+        print(f"    starting {FAILOVER_SERVICE} ...")
         try:
             process = compose("start", FAILOVER_SERVICE)
             restart_ok = process.returncode == 0
             if not restart_ok:
-                print(f"  [!] start failed: {output_tail(process)}")
+                print(f"    [!] start failed: {output_tail(process)}")
             recovered = poll_health(
                 lambda body: set(healthy_replicas(body, FAILOVER_SHARD))
                 == {FAILOVER_REPLICA, HEALTHY_REPLICA},
                 timeout=120,
             )
+            healthy = healthy_replicas(
+                recovered or health_body() or {}, FAILOVER_SHARD
+            )
+            print(f"    shard-b healthy: {', '.join(healthy) or '-'}")
             results.check(
-                "E4 replica restarted and is healthy again",
+                "replica restarted and is healthy again",
                 restart_ok and recovered is not None,
-                (
-                    healthy_replicas(health_body() or {}, FAILOVER_SHARD)
-                    if recovered is None
-                    else "healthy"
-                ),
+                healthy,
             )
         except Exception as exc:  # noqa: BLE001 - cleanup must not mask errors
             results.check(
-                "E4 replica restarted and is healthy again",
+                "replica restarted and is healthy again",
                 False,
                 f"{type(exc).__name__}: {exc}",
             )
@@ -718,36 +732,30 @@ def experiment_4(results):
 # EXPERIMENT 5: LOCAL AND CROSS-SHARD TRANSFERS
 # ============================================================
 def experiment_5(results):
-    results.begin(5)
-    print_header("EXPERIMENT 5: LOCAL AND CROSS-SHARD TRANSFERS")
-    print("  Local transfer: both accounts live in one shard database, so one")
-    print("  database transaction is enough and no coordinator is involved.")
-    print("  Cross-shard transfer: the debit and the credit live in different")
-    print("  databases. The coordinator prepares both, records a durable")
-    print("  decision, then commits both participants.\n")
-    wait()
-
-    print(f"  Local transfer {LOCAL_A} -> {LOCAL_B} (10.00):")
+    print(f"  Local transfer   {LOCAL_A} -> {LOCAL_B}")
     before_from = require_balance(LOCAL_A)
     before_to = require_balance(LOCAL_B)
     response = post_transfer(LOCAL_A, LOCAL_B, "10.00")
     body = body_of(response)
 
     results.check(
-        "E5 local transfer returns 200",
+        "local transfer returns 200",
         response is not None and response.status_code == 200,
         body,
     )
     results.check(
-        "E5 local transfer reports mode=local",
+        "local transfer reports mode=local",
         body.get("mode") == "local",
         body.get("mode"),
     )
     after_from = require_balance(LOCAL_A)
     after_to = require_balance(LOCAL_B)
-    print(f"    balances: {before_from}->{after_from}  {before_to}->{after_to}")
+    print(
+        f"    mode=local   {before_from} -> {after_from}"
+        f" | {before_to} -> {after_to}"
+    )
     results.check(
-        "E5 local transfer moves both balances",
+        "local transfer moves both balances",
         after_from == before_from - Decimal("10.00")
         and after_to == before_to + Decimal("10.00"),
         (after_from, after_to),
@@ -756,8 +764,9 @@ def experiment_5(results):
     response = post_transfer(LOCAL_B, LOCAL_A, "10.00")
     restored_from = require_balance(LOCAL_A)
     restored_to = require_balance(LOCAL_B)
+    print("    reverse restored balances")
     results.check(
-        "E5 local reverse restores balances",
+        "local reverse restores balances",
         response is not None
         and response.status_code == 200
         and restored_from == before_from
@@ -765,7 +774,7 @@ def experiment_5(results):
         (restored_from, restored_to),
     )
 
-    print(f"\n  Cross-shard transfer {CROSS_A} -> {CROSS_B} (10.00):")
+    print(f"\n  Cross-shard transfer   {CROSS_A} -> {CROSS_B}")
     before_from = require_balance(CROSS_A)
     before_to = require_balance(CROSS_B)
     response = post_transfer(CROSS_A, CROSS_B, "10.00")
@@ -773,25 +782,29 @@ def experiment_5(results):
     txid = body.get("txid")
 
     results.check(
-        "E5 cross-shard transfer returns 200",
+        "cross-shard transfer returns 200",
         response is not None and response.status_code == 200,
         body,
     )
     results.check(
-        "E5 cross-shard transfer reports mode=cross-shard",
+        "cross-shard transfer reports mode=cross-shard",
         body.get("mode") == "cross-shard",
         body.get("mode"),
     )
     results.check(
-        "E5 cross-shard transfer is COMPLETED",
+        "cross-shard transfer is COMPLETED",
         body.get("state") == "COMPLETED",
         body.get("state"),
     )
     after_from = require_balance(CROSS_A)
     after_to = require_balance(CROSS_B)
-    print(f"    balances: {before_from}->{after_from}  {before_to}->{after_to}")
+    print(
+        f"    mode=cross-shard   {body.get('state', '-')}   "
+        f"txid={txid or '-'}"
+    )
+    print(f"    {before_from} -> {after_from} | {before_to} -> {after_to}")
     results.check(
-        "E5 cross-shard transfer moves both balances",
+        "cross-shard transfer moves both balances",
         after_from == before_from - Decimal("10.00")
         and after_to == before_to + Decimal("10.00"),
         (after_from, after_to),
@@ -799,20 +812,21 @@ def experiment_5(results):
 
     if txid:
         status_body = transaction_body(txid)
-        print(f"    transaction status for {txid}: {status_body.get('status')}")
+        print(f"    txid status: {status_body.get('status', '-')}")
         results.check(
-            "E5 transaction status reports COMPLETED",
+            "transaction status reports COMPLETED",
             status_body.get("status") == "COMPLETED",
             status_body.get("status"),
         )
     else:
-        results.check("E5 cross-shard transfer returned a txid", False)
+        results.check("cross-shard transfer returned a txid", False)
 
     response = post_transfer(CROSS_B, CROSS_A, "10.00")
     restored_from = require_balance(CROSS_A)
     restored_to = require_balance(CROSS_B)
+    print("    reverse restored balances")
     results.check(
-        "E5 cross-shard reverse restores balances",
+        "cross-shard reverse restores balances",
         response is not None
         and response.status_code == 200
         and restored_from == before_from
@@ -825,40 +839,31 @@ def experiment_5(results):
 # EXPERIMENT 6: INTERRUPTED DISTRIBUTED TRANSACTION
 # ============================================================
 def experiment_6(results):
-    results.begin(6)
-    print_header("EXPERIMENT 6: INTERRUPTED DISTRIBUTED TRANSACTION")
-    print("  A cross-shard transfer is paused after the durable COMMIT")
-    print("  decision. The Gateway (and with it the coordinator) is stopped")
-    print("  before the participants acknowledge. After a restart, recovery")
-    print("  must finish the recorded COMMIT exactly once.\n")
-    print(
-        "  ACTION: this script will stop and restart the Gateway. The stack "
-        "is restored in a finally block."
-    )
-    wait()
-
     before_source = require_balance(FAULT_A)
     before_target = require_balance(FAULT_B)
     txid = None
     thread = None
 
     try:
+        print("  Phase 1: stop after the durable COMMIT decision")
         process = compose(
             "up", "-d", "gateway",
             env={"COORD_TEST_PAUSE_AFTER_DECISION_SECONDS": "30"},
         )
         results.check(
-            "E6 Gateway started with a post-decision pause",
+            "Gateway started with a post-decision pause",
             process.returncode == 0,
             output_tail(process),
         )
         results.check(
-            "E6 Gateway is healthy before the transfer",
+            "Gateway is healthy before the transfer",
             wait_health(120) is not None,
         )
 
         thread = threading.Thread(
-            target=lambda: post_transfer(FAULT_A, FAULT_B, "1.00"),
+            target=lambda: post_transfer(
+                FAULT_A, FAULT_B, "1.00", quiet=True
+            ),
             daemon=True,
         )
         thread.start()
@@ -875,29 +880,36 @@ def experiment_6(results):
 
         txid = poll_until(find_decided_transaction, bool, timeout=60)
         results.check(
-            "E6 durable COMMIT decision recorded",
+            "durable COMMIT decision recorded",
             bool(txid),
             txid or "decision not observed",
         )
 
         if txid:
-            results.check(
-                "E6 both participants are prepared before COMMIT",
-                prepared_count(FAULT_A, txid) == 1
-                and prepared_count(FAULT_B, txid) == 1,
-                (prepared_count(FAULT_A, txid), prepared_count(FAULT_B, txid)),
+            prepared_a = prepared_count(FAULT_A, txid)
+            prepared_b = prepared_count(FAULT_B, txid)
+            source_balance = require_balance(FAULT_A)
+            target_balance = require_balance(FAULT_B)
+            print(
+                f"    state=COMMIT_DECIDED   prepared={prepared_a + prepared_b}"
+                f"   balances unchanged"
             )
             results.check(
-                "E6 balances are untouched before COMMIT",
-                require_balance(FAULT_A) == before_source
-                and require_balance(FAULT_B) == before_target,
-                (require_balance(FAULT_A), require_balance(FAULT_B)),
+                "both participants are prepared before COMMIT",
+                prepared_a == 1 and prepared_b == 1,
+                (prepared_a, prepared_b),
+            )
+            results.check(
+                "balances are untouched before COMMIT",
+                source_balance == before_source
+                and target_balance == before_target,
+                (source_balance, target_balance),
             )
 
-        print("  stopping the Gateway before the commits are acknowledged ...")
+        print("    stopping the Gateway before the commits are acknowledged ...")
         process = compose("stop", "gateway")
         results.check(
-            "E6 Gateway stopped",
+            "Gateway stopped",
             process.returncode == 0,
             output_tail(process),
         )
@@ -911,34 +923,37 @@ def experiment_6(results):
                 "SELECT state || '|' || coalesce(decision, '') "
                 f"FROM coordinator_transactions WHERE txid='{txid}';",
             )
+            prepared_a = prepared_count(FAULT_A, txid)
+            prepared_b = prepared_count(FAULT_B, txid)
+            print(
+                "    Gateway stopped; decision and prepared transactions"
+                " survived"
+            )
             results.check(
-                "E6 COMMIT decision survives the interruption",
+                "COMMIT decision survives the interruption",
                 row == "COMMIT_DECIDED|COMMIT",
                 row,
             )
             results.check(
-                "E6 prepared transactions survive the interruption",
-                prepared_count(FAULT_A, txid) == 1
-                and prepared_count(FAULT_B, txid) == 1,
-                (prepared_count(FAULT_A, txid), prepared_count(FAULT_B, txid)),
+                "prepared transactions survive the interruption",
+                prepared_a == 1 and prepared_b == 1,
+                (prepared_a, prepared_b),
             )
 
-        print("\n  The stack is now interrupted; the durable decision and both")
-        print("  prepared transactions are waiting in the databases.")
-        wait()
+        print("\n  Phase 2: restart and recover")
+        wait("  Press Enter to restart the Gateway and run recovery...")
 
-        print("  restarting the Gateway with recovery enabled ...")
         process = compose(
             "up", "-d", "gateway",
             env={"COORD_TEST_PAUSE_AFTER_DECISION_SECONDS": "0"},
         )
         results.check(
-            "E6 Gateway restarted",
+            "Gateway restarted",
             process.returncode == 0,
             output_tail(process),
         )
         results.check(
-            "E6 Gateway is healthy after restart",
+            "Gateway is healthy after restart",
             wait_health(120) is not None,
         )
 
@@ -948,32 +963,46 @@ def experiment_6(results):
                 lambda body: body.get("status") == "COMPLETED",
                 timeout=120,
             )
+            prepared_a = prepared_count(FAULT_A, txid)
+            prepared_b = prepared_count(FAULT_B, txid)
+            source_balance = require_balance(FAULT_A)
+            target_balance = require_balance(FAULT_B)
+            final_status = (
+                final.get("status") if isinstance(final, dict) else "-"
+            )
+            print(
+                f"    state={final_status or '-'}"
+                f"   prepared={prepared_a + prepared_b}"
+                f"   applied exactly once"
+            )
             results.check(
-                "E6 recovery completed the recorded COMMIT",
+                "recovery completed the recorded COMMIT",
                 final is not None,
                 final,
             )
             results.check(
-                "E6 prepared transactions are resolved",
-                prepared_count(FAULT_A, txid) == 0
-                and prepared_count(FAULT_B, txid) == 0,
-                (prepared_count(FAULT_A, txid), prepared_count(FAULT_B, txid)),
+                "prepared transactions are resolved",
+                prepared_a == 0 and prepared_b == 0,
+                (prepared_a, prepared_b),
             )
             results.check(
-                "E6 credit and debit applied exactly once",
-                require_balance(FAULT_A) == before_source - Decimal("1.00")
-                and require_balance(FAULT_B) == before_target + Decimal("1.00"),
-                (require_balance(FAULT_A), require_balance(FAULT_B)),
+                "credit and debit applied exactly once",
+                source_balance == before_source - Decimal("1.00")
+                and target_balance == before_target + Decimal("1.00"),
+                (source_balance, target_balance),
             )
 
             response = post_transfer(FAULT_B, FAULT_A, "1.00")
+            source_balance = require_balance(FAULT_A)
+            target_balance = require_balance(FAULT_B)
+            print("    reverse restored balances")
             results.check(
-                "E6 reverse transfer restores balances",
+                "reverse transfer restores balances",
                 response is not None
                 and response.status_code == 200
-                and require_balance(FAULT_A) == before_source
-                and require_balance(FAULT_B) == before_target,
-                (require_balance(FAULT_A), require_balance(FAULT_B)),
+                and source_balance == before_source
+                and target_balance == before_target,
+                (source_balance, target_balance),
             )
     finally:
         try:
@@ -985,12 +1014,12 @@ def experiment_6(results):
                 wait_health(120)
             else:
                 print(
-                    "  [!] could not reset the Gateway pause setting: "
+                    "    [!] could not reset the Gateway pause setting: "
                     f"{output_tail(process)}"
                 )
         except Exception as exc:  # noqa: BLE001 - cleanup must not mask errors
             print(
-                "  [!] could not reset the Gateway pause setting: "
+                "    [!] could not reset the Gateway pause setting: "
                 f"{type(exc).__name__}: {exc}"
             )
 
@@ -999,14 +1028,6 @@ def experiment_6(results):
 # EXPERIMENT 7: CONCURRENT CROSS-SHARD AND LOCAL TRANSFERS
 # ============================================================
 def experiment_7(results):
-    results.begin(7)
-    print_header("EXPERIMENT 7: CONCURRENT CROSS-SHARD AND LOCAL TRANSFERS")
-    print("  Opposite-direction transfers over the same two accounts run")
-    print("  concurrently. A global ascending lock order must prevent")
-    print("  deadlocks, every transaction must reach a terminal state, and")
-    print("  money must be conserved. A same-shard burst follows.\n")
-    wait()
-
     before_a = require_balance(CONCURRENT_A)
     before_b = require_balance(CONCURRENT_B)
     total_before = before_a + before_b
@@ -1017,10 +1038,8 @@ def experiment_7(results):
         for index in range(60)
     ]
 
-    print(
-        f"  {len(pairs)} concurrent cross-shard transfers "
-        f"(20 workers) over {CONCURRENT_A} <-> {CONCURRENT_B} ..."
-    )
+    print("  Cross-shard burst")
+    print(f"    running {len(pairs)} concurrent transfers ...")
     started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=20) as executor:
         responses = list(
@@ -1037,18 +1056,22 @@ def experiment_7(results):
     )
     bodies = [body_of(response) for response in responses]
     txids = [body.get("txid") for body in bodies if body.get("txid")]
+    completed = sum(
+        1 for body in bodies if body.get("state") == "COMPLETED"
+    )
 
-    print(f"    statuses: {dict(statuses)}  elapsed: {elapsed:.2f}s")
-
+    print(
+        f"    {len(pairs)} transfers   {statuses.get(200, 0)}/{len(pairs)}"
+        f" HTTP 200   {completed}/{len(pairs)} COMPLETED   {elapsed:.2f}s"
+    )
     results.check(
-        "E7 all concurrent cross-shard transfers return 200",
+        "all concurrent cross-shard transfers return 200",
         statuses.get(200) == len(pairs),
         dict(statuses),
     )
     results.check(
-        "E7 all concurrent cross-shard transfers are COMPLETED",
-        len(txids) == len(pairs)
-        and all(body.get("state") == "COMPLETED" for body in bodies),
+        "all concurrent cross-shard transfers are COMPLETED",
+        len(txids) == len(pairs) and completed == len(pairs),
         Counter(body.get("state") for body in bodies),
     )
 
@@ -1057,45 +1080,63 @@ def experiment_7(results):
         if txids
         else Counter()
     )
+    print(
+        f"    txid status: {reported.get('COMPLETED', 0)}/{len(txids)}"
+        " COMPLETED"
+    )
     results.check(
-        "E7 every txid reports COMPLETED",
+        "every txid reports COMPLETED",
         bool(txids) and reported.get("COMPLETED") == len(txids),
         dict(reported),
     )
 
     after_a = require_balance(CONCURRENT_A)
     after_b = require_balance(CONCURRENT_B)
-    print(f"    balances: {before_a}->{after_a}  {before_b}->{after_b}")
+    print(
+        f"    balances {before_a} -> {after_a} | {before_b} -> {after_b}"
+        "   money conserved"
+    )
     results.check(
-        "E7 money is conserved",
+        "money is conserved",
         after_a + after_b == total_before,
         (after_a, after_b, total_before),
     )
     results.check(
-        "E7 opposite directions net to zero",
+        "opposite directions net to zero",
         after_a == before_a and after_b == before_b,
         (after_a, after_b),
     )
 
     health = wait_health(60) or {}
+    unresolved = health.get("coordinator", {}).get("unresolved")
+    prepared_a = psql(
+        "db-a", "banking_a", "SELECT count(*) FROM pg_prepared_xacts;"
+    )
+    prepared_b = psql(
+        "db-b", "banking_b", "SELECT count(*) FROM pg_prepared_xacts;"
+    )
+    print("\n  Coordinator and participants")
+    print(
+        f"    unresolved={unresolved}   prepared shard-a={prepared_a}"
+        f"   prepared shard-b={prepared_b}"
+    )
     results.check(
-        "E7 no unresolved coordinator rows",
-        health.get("coordinator", {}).get("unresolved") == 0,
+        "no unresolved coordinator rows",
+        unresolved == 0,
         health.get("coordinator"),
     )
     results.check(
-        "E7 no prepared transactions remain on shard A",
-        psql("db-a", "banking_a", "SELECT count(*) FROM pg_prepared_xacts;") == "0",
+        "no prepared transactions remain on shard A",
+        prepared_a == "0",
+        prepared_a,
     )
     results.check(
-        "E7 no prepared transactions remain on shard B",
-        psql("db-b", "banking_b", "SELECT count(*) FROM pg_prepared_xacts;") == "0",
+        "no prepared transactions remain on shard B",
+        prepared_b == "0",
+        prepared_b,
     )
 
-    print(
-        f"\n  Concurrent local transfers "
-        f"{LOCAL_CONCURRENT_A} <-> {LOCAL_CONCURRENT_B} (40 x 2.00):"
-    )
+    print("\n  Local burst")
     local_before_a = require_balance(LOCAL_CONCURRENT_A)
     local_before_b = require_balance(LOCAL_CONCURRENT_B)
     local_total = local_before_a + local_before_b
@@ -1119,29 +1160,36 @@ def experiment_7(results):
     local_modes = Counter(
         body_of(response).get("mode") for response in local_responses
     )
-    print(f"    statuses: {dict(local_statuses)}  modes: {dict(local_modes)}")
+    final_local_a = require_balance(LOCAL_CONCURRENT_A)
+    final_local_b = require_balance(LOCAL_CONCURRENT_B)
+    print(
+        f"    {len(local_pairs)} transfers   {local_statuses.get(200, 0)}"
+        f"/{len(local_pairs)} HTTP 200   mode=local"
+    )
+    print(
+        f"    balances {local_before_a} -> {final_local_a}"
+        f" | {local_before_b} -> {final_local_b}   money conserved"
+    )
 
     results.check(
-        "E7 all concurrent local transfers return 200",
+        "all concurrent local transfers return 200",
         local_statuses.get(200) == len(local_pairs),
         dict(local_statuses),
     )
     results.check(
-        "E7 local transfers keep mode=local",
+        "local transfers keep mode=local",
         local_modes.get("local") == len(local_pairs),
         dict(local_modes),
     )
     results.check(
-        "E7 local money is conserved",
-        require_balance(LOCAL_CONCURRENT_A)
-        + require_balance(LOCAL_CONCURRENT_B)
-        == local_total,
+        "local money is conserved",
+        final_local_a + final_local_b == local_total,
+        (final_local_a, final_local_b, local_total),
     )
-    final_local_a = require_balance(LOCAL_CONCURRENT_A)
-    final_local_b = require_balance(LOCAL_CONCURRENT_B)
     results.check(
-        "E7 local opposite directions net to zero",
-        final_local_a == local_before_a and final_local_b == local_before_b,
+        "local opposite directions net to zero",
+        final_local_a == local_before_a
+        and final_local_b == local_before_b,
         (final_local_a, final_local_b),
     )
 
@@ -1151,42 +1199,56 @@ def experiment_7(results):
 # ============================================================
 def print_summary(results):
     print_header("SUMMARY")
+    print(f"  #   {'Experiment':<45} {'Result':<6}  {'Time':>5}")
+    print(f"  {'-' * 65}")
+    passed = 0
+
     for number in range(1, 8):
-        passed, total = results.records.get(number, [0, 0])
-        complete = total > 0 and passed == total
-        mark = "[PASS]" if complete else "[FAIL]"
+        record = results.records.get(number)
+        if record is None:
+            status = "FAIL"
+            elapsed = "-"
+        else:
+            status = "PASS" if record["ok"] else "FAIL"
+            elapsed = f"{record['elapsed']:.1f}s"
+            if record["ok"]:
+                passed += 1
         print(
-            f"  {mark} Experiment {number}: "
-            f"{EXPERIMENT_TITLES[number]:<45} {passed}/{total}"
+            f"  {number}   {EXPERIMENT_TITLES[number]:<45}"
+            f" {status:<6}  {elapsed:>5}"
         )
 
-    passed = results.total - results.failed
-    print(f"\n  {passed}/{results.total} checks passed")
-    print(f"  RESULT: {'PASS' if results.ok else 'FAIL'}")
-    print(f"{'=' * 68}\n")
+    print(f"  {'-' * 65}")
+    print(f"  Experiments: {passed}/7 passed")
+    if VERBOSE:
+        print(
+            f"  Internal assertions: {results.total - results.failed}"
+            f"/{results.total} passed"
+        )
+    print(f"  RESULT: {'PASS' if passed == 7 else 'FAIL'}")
+    print(f"{'=' * 70}\n")
 
 
 def main():
-    print(f"\n{'=' * 68}")
-    print("  DISTRIBUTED BANKING PLATFORM - INTERACTIVE EXPERIMENTS 1-7")
-    print(f"{'=' * 68}")
+    print_header("ASSIGNMENT 2 - EXPERIMENTS 1-7")
     print(f"  Gateway: {BASE_ROOT}")
-    print(f"  Accounts: route={ROUTE_A}/{ROUTE_B}  load={LOAD_A}/{LOAD_B}")
-    print(f"            ops={OPS_A}/{OPS_B}  failover={FAILOVER_ACCOUNT}")
-    print(f"            local={LOCAL_A}/{LOCAL_B}  cross={CROSS_A}/{CROSS_B}")
-    print(f"            fault={FAULT_A}/{FAULT_B}")
-    print(f"            concurrent={CONCURRENT_A}/{CONCURRENT_B}")
+    print("  All traffic goes through the Gateway; Docker and psql are")
+    print("  used only to observe the stack.")
 
-    wait()
+    wait("\nPress Enter to check the Gateway and start...")
 
     health = wait_health(30)
     if health is None:
-        print("\n  [FAIL]  Gateway and coordinator are not healthy")
+        print("\n  [FAIL] Gateway or coordinator is not healthy.")
+        print("  Check: docker compose ps")
         return 1
 
-    print("\n  Gateway health:")
-    print(f"    shards: {_detail(health.get('shards', {}))}")
-    print(f"    coordinator: {_detail(health.get('coordinator', {}))}")
+    replicas_a = healthy_replicas(health, "shard-a")
+    replicas_b = healthy_replicas(health, "shard-b")
+    print(
+        f"\n  Gateway ready: shard-a={', '.join(replicas_a)}"
+        f"   shard-b={', '.join(replicas_b)}   coordinator=ok"
+    )
 
     results = Results()
     runners = (
@@ -1198,24 +1260,47 @@ def main():
         (6, experiment_6),
         (7, experiment_7),
     )
+    current = None
 
     try:
         for number, runner in runners:
+            print_header(f"{number}/7  {EXPERIMENT_TITLES[number].upper()}")
+            print(f"  Goal: {EXPERIMENT_GOALS[number]}")
+            if number == 4:
+                print(
+                    f"  Note: stops {FAILOVER_SERVICE} briefly; it is"
+                    " restarted automatically."
+                )
+            if number == 6:
+                print(
+                    "  Note: stops and restarts the Gateway; the stack is"
+                    " restored automatically."
+                )
+            wait(f"\nPress Enter to run Experiment {number}/7 ...")
+
+            results.begin(number)
+            current = number
+            started = time.perf_counter()
             try:
                 runner(results)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:  # noqa: BLE001 - report instead of crashing
                 print(
-                    f"\n  [FAIL]  experiment {number} aborted: "
+                    f"\n  [!] Experiment {number} aborted: "
                     f"{type(exc).__name__}: {exc}"
                 )
                 results.abort(number, exc)
+            results.finish(number, time.perf_counter() - started)
+            current = None
     except KeyboardInterrupt:
-        print("\n\n  [!]  Interrupted")
+        print("\n\n  [!] Interrupted")
+        if current is not None:
+            results.abort(current, KeyboardInterrupt())
+            results.finish(current, 0.0)
 
     print_summary(results)
-    return 0 if results.ok else 1
+    return 0 if results.ok and len(results.records) == 7 else 1
 
 
 if __name__ == "__main__":
