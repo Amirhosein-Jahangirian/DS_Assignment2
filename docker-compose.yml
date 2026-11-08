@@ -1,5 +1,12 @@
+# Public Docker Hub images:
+#   https://hub.docker.com/repository/docker/amirhossein002/banking_with_sharding
+# Tags:
+#   replica_api - Django/DRF shard image (also used for migrations)
+#   gateway     - FastAPI shard-aware gateway and 2PC coordinator
+# Run `docker compose pull` to fetch the published images, then
+# `docker compose up -d` to start the stack.
 x-api-common: &api-common
-  build: .
+  image: amirhossein002/banking_with_sharding:replica_api
   env_file: .env
   volumes:
     - ./config:/app/config:ro
@@ -37,7 +44,7 @@ services:
 
   # One-shot schema migration for shard A. Runs before the A replicas start.
   migrate-a:
-    build: .
+    image: amirhossein002/banking_with_sharding:replica_api
     command: ["python", "manage.py", "migrate", "--noinput"]
     env_file: .env
     environment:
@@ -108,7 +115,7 @@ services:
       retries: 10
 
   migrate-b:
-    build: .
+    image: amirhossein002/banking_with_sharding:replica_api
     command: ["python", "manage.py", "migrate", "--noinput"]
     env_file: .env
     environment:
@@ -180,7 +187,7 @@ services:
   # the 2PC coordinator; its decision log lives in coord-db.
   # ---------------------------------------------------------------------------
   gateway:
-    build: ./gateway
+    image: amirhossein002/banking_with_sharding:gateway
     environment:
       CONFIG_DIR: /app/config
       COORD_DB_HOST: coord-db
